@@ -313,6 +313,7 @@ def test_items_follow_snapshot_response_shape(client):
         "bucket_value",
         "matched_rule_index",
         "variant_key",
+        "decision_path",
         "explanation",
         "decided_at",
     }

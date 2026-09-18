@@ -1,5 +1,6 @@
 """请求 / 响应数据模型（Pydantic v2）。"""
 
+from datetime import datetime, timezone
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -102,6 +103,42 @@ class RollbackRequest(BaseModel):
     )
 
 
+class OverrideUpsertRequest(BaseModel):
+    """按用户临时强制变体写入请求（PUT，整体替换）。"""
+
+    variant_key: str = Field(min_length=1, max_length=128, description="强制返回的变体 key")
+    reason: str = Field(min_length=1, max_length=512, description="人工原因说明，会固化进判定快照解释链")
+    expires_at: datetime | None = Field(
+        default=None,
+        description="可选到期时间（ISO 8601，建议带时区）；必须是未来的 UTC 时间，省略表示长期有效",
+    )
+
+    @field_validator("expires_at")
+    @classmethod
+    def _expires_must_be_future(cls, v: datetime | None) -> datetime | None:
+        if v is None:
+            return None
+        # 统一规范化为 UTC；naive datetime 视为 UTC
+        if v.tzinfo is None:
+            v = v.replace(tzinfo=timezone.utc)
+        v = v.astimezone(timezone.utc)
+        if v <= datetime.now(timezone.utc):
+            raise ValueError("expires_at 必须是未来的 UTC 时间")
+        return v
+
+
+class OverrideResponse(BaseModel):
+    """按用户临时强制变体。"""
+
+    flag_key: str
+    user_id: str
+    variant_key: str
+    reason: str
+    expires_at: Any = Field(description="到期时间（UTC，naive ISO 8601）；null 表示长期有效")
+    created_at: Any
+    updated_at: Any
+
+
 class EvaluateRequest(BaseModel):
     flag_key: str | None = Field(default=None, max_length=128, description="路径式调用可省略")
     user_id: str = Field(min_length=1, max_length=128)
@@ -129,7 +166,7 @@ class EvaluateResponse(BaseModel):
     )
     bucket_value: int | None = Field(description="0-99 的稳定哈希分桶值；规则命中时为 null")
     variant_key: str
-    decision_path: Literal["rule", "bucket"]
+    decision_path: Literal["rule", "bucket", "override"]
     explanation: list[ExplanationStep]
 
 
@@ -142,6 +179,7 @@ class SnapshotResponse(BaseModel):
     bucket_value: int | None
     matched_rule_index: int | None
     variant_key: str
+    decision_path: Literal["rule", "bucket", "override"]
     explanation: list[ExplanationStep]
     decided_at: Any
 

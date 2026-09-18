@@ -2,14 +2,14 @@
 
 import json
 from collections.abc import Sequence
-from datetime import datetime
+from datetime import datetime, timezone
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, inspect, select
 from sqlalchemy.orm import Session
 
 from app import engine as eng
-from app.models import DecisionSnapshot, FlagConfig, FlagConfigVersion
-from app.schemas import FlagUpsertRequest, RuleIn, VariantIn
+from app.models import DecisionSnapshot, FlagConfig, FlagConfigVersion, UserOverride
+from app.schemas import FlagUpsertRequest, OverrideUpsertRequest, RuleIn, VariantIn
 
 
 class NotFound(Exception):
@@ -22,6 +22,10 @@ class VersionNotFound(Exception):
 
 class VersionConflict(Exception):
     """expected_current_version 与实际当前版本不一致（期望版本已过期）。"""
+
+
+class VariantNotFound(Exception):
+    """variant_key 不存在于开关当前配置。"""
 
 
 def parse_rules(raw: str) -> list[eng.Rule]:
@@ -131,6 +135,8 @@ def delete_flag(db: Session, flag_key: str) -> bool:
         return False
     # 版本历史随开关一起删除，避免删除后重建同 key 开关时版本号冲突
     db.execute(delete(FlagConfigVersion).where(FlagConfigVersion.flag_key == flag_key))
+    # 用户级 override 同样级联删除，避免重建同名开关后旧强制记录复活
+    db.execute(delete(UserOverride).where(UserOverride.flag_key == flag_key))
     db.delete(flag)
     db.commit()
     return True
@@ -188,6 +194,108 @@ def flag_to_response(flag: FlagConfig) -> dict:
     }
 
 
+def variant_keys_of(flag: FlagConfig) -> set[str]:
+    return {item["key"] for item in json.loads(flag.variants_json)}
+
+
+# ---------------------------------------------------------------------------
+# 按用户临时强制变体（override）
+# ---------------------------------------------------------------------------
+
+
+def _naive_utc(dt: datetime) -> datetime:
+    """统一成 naive UTC 存储，与 SQLite 读出形态及 _utcnow 写入保持一致。"""
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+
+def get_override(db: Session, flag_key: str, user_id: str) -> UserOverride | None:
+    return db.scalar(
+        select(UserOverride).where(
+            UserOverride.flag_key == flag_key,
+            UserOverride.user_id == user_id,
+        )
+    )
+
+
+def get_active_override(
+    db: Session, flag: FlagConfig, user_id: str
+) -> UserOverride | None:
+    """返回当前判定应生效的 override，否则 None。
+
+    仅当记录未过期（expires_at 为空或晚于当前 UTC 时间）**且**强制变体仍
+    存在于开关当前配置时生效；到期或变体已被配置移除的记录不生效。
+    """
+    record = get_override(db, flag.flag_key, user_id)
+    if record is None:
+        return None
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    if record.expires_at is not None:
+        # SQLite 读出为 naive UTC；兼容其他后端可能给出 aware datetime
+        expires = record.expires_at
+        if expires.tzinfo is not None:
+            expires = expires.astimezone(timezone.utc).replace(tzinfo=None)
+        if expires <= now:
+            return None
+    if record.variant_key not in variant_keys_of(flag):
+        return None
+    return record
+
+
+def upsert_override(
+    db: Session, flag: FlagConfig, user_id: str, payload: OverrideUpsertRequest
+) -> UserOverride:
+    """写入或整体替换某开关下某用户的临时强制变体。
+
+    variant_key 必须存在于开关当前配置，否则抛 VariantNotFound；
+    expires_at 规范化为 naive UTC（None 表示长期有效）。
+    """
+    if payload.variant_key not in variant_keys_of(flag):
+        raise VariantNotFound(payload.variant_key)
+
+    record = get_override(db, flag.flag_key, user_id)
+    expires = _naive_utc(payload.expires_at) if payload.expires_at is not None else None
+    if record is None:
+        record = UserOverride(
+            flag_key=flag.flag_key,
+            user_id=user_id,
+            variant_key=payload.variant_key,
+            reason=payload.reason,
+            expires_at=expires,
+        )
+        db.add(record)
+    else:
+        record.variant_key = payload.variant_key
+        record.reason = payload.reason
+        record.expires_at = expires
+    db.commit()
+    db.refresh(record)
+    return record
+
+
+def delete_override(db: Session, flag_key: str, user_id: str) -> bool:
+    """撤销指定 override；记录不存在同样视为成功（幂等），返回是否删除了行。"""
+    record = get_override(db, flag_key, user_id)
+    if record is None:
+        return False
+    db.delete(record)
+    db.commit()
+    return True
+
+
+def override_to_response(record: UserOverride) -> dict:
+    return {
+        "flag_key": record.flag_key,
+        "user_id": record.user_id,
+        "variant_key": record.variant_key,
+        "reason": record.reason,
+        "expires_at": record.expires_at,
+        "created_at": record.created_at,
+        "updated_at": record.updated_at,
+    }
+
+
 def version_to_response(ver: FlagConfigVersion) -> dict:
     rules = [RuleIn(**item) for item in json.loads(ver.rules_json)]
     variants = [VariantIn(**item) for item in json.loads(ver.variants_json)]
@@ -220,6 +328,7 @@ def save_snapshot(
         bucket_value=decision.bucket_value,
         matched_rule_index=decision.matched_rule_index,
         variant_key=decision.variant_key,
+        decision_path=decision.decision_path,
         explanation_json=json.dumps(decision.explanation, ensure_ascii=False),
     )
     db.add(snapshot)
@@ -239,6 +348,22 @@ def count_snapshots(db: Session) -> int:
 def max_snapshot_id(db: Session) -> int | None:
     """返回当前最大自增 id（首页发起时的高水位）；空表返回 None。"""
     return db.scalar(select(func.max(DecisionSnapshot.id)))
+
+
+def ensure_snapshot_decision_path_column(db: Session) -> None:
+    """为老库 decision_snapshots 幂等追加 decision_path 列。
+
+    ``Base.metadata.create_all`` 只建新表、不会向老表追加新列；升级启动时
+    通过 SQLAlchemy inspector 检测列是否存在，缺失才执行 ADD COLUMN
+    （SQLite 3.35+ 与 PostgreSQL 均支持不带默认值的 ADD COLUMN，无需回填）。
+    老行该列为 NULL，读取时按 matched_rule_index 回退推断。
+    """
+    from sqlalchemy import text
+
+    columns = {c["name"] for c in inspect(db.bind).get_columns("decision_snapshots")}
+    if "decision_path" not in columns:
+        db.execute(text("ALTER TABLE decision_snapshots ADD COLUMN decision_path VARCHAR(16)"))
+        db.commit()
 
 
 def ensure_decision_audit_indexes(db: Session) -> None:

@@ -82,5 +82,34 @@ class DecisionSnapshot(Base):
     bucket_value: Mapped[int | None] = mapped_column(Integer, nullable=True)
     matched_rule_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
     variant_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    # 显式固化判定路径（rule / bucket / override）；老数据为 NULL 时按
+    # matched_rule_index 是否为空回退推断，保证升级前快照仍可回放。
+    decision_path: Mapped[str | None] = mapped_column(String(16), nullable=True)
     explanation_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
     decided_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class UserOverride(Base):
+    """按用户的临时强制变体（override）。
+
+    仅当未指定 config_version 判定时参与：记录未过期且 variant_key 仍存在
+    于开关当前配置时直接命中（decision_path=override），跳过规则与分桶；
+    到期或变体已被移除的记录不生效，但保留在表中直至被 DELETE 或替换。
+    expires_at 以 naive UTC 存储，为 NULL 表示长期有效。
+    """
+
+    __tablename__ = "user_overrides"
+    __table_args__ = (
+        UniqueConstraint("flag_key", "user_id", name="uq_user_override_flag_user"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    flag_key: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    user_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    variant_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    reason: Mapped[str] = mapped_column(String(512), nullable=False)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )

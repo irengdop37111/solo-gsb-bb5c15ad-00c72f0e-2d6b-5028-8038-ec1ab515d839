@@ -7,6 +7,7 @@ from app.engine import (
     RuleEvaluationError,
     Variant,
     decide,
+    decide_override,
     evaluate_rule,
     pick_variant_by_weight,
     stable_bucket,
@@ -99,3 +100,23 @@ def test_zero_weight_variant_never_bucketed():
     vs = [Variant("a", 0), Variant("b", 100)]
     for b in range(100):
         assert pick_variant_by_weight(vs, b)[0] == "b"
+
+
+def test_decide_override_skips_rules_and_bucket():
+    d = decide_override(variant_key="off", reason="客服补偿", expires_at="2026-10-01T00:00:00")
+    assert d.decision_path == "override"
+    assert d.variant_key == "off"
+    assert d.bucket_value is None
+    assert d.matched_rule is None
+    assert d.matched_rule_index is None
+    steps = {e["step"]: e["detail"] for e in d.explanation}
+    assert set(steps) == {"override_loaded", "override_selected"}
+    assert steps["override_loaded"]["variant_key"] == "off"
+    assert steps["override_loaded"]["reason"] == "客服补偿"
+    assert steps["override_loaded"]["expires_at"] == "2026-10-01T00:00:00"
+
+
+def test_decide_override_without_expiry():
+    d = decide_override(variant_key="on", reason="永久白名单", expires_at=None)
+    loaded = next(e for e in d.explanation if e["step"] == "override_loaded")
+    assert loaded["detail"]["expires_at"] is None

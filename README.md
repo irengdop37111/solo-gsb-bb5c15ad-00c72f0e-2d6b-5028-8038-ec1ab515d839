@@ -10,8 +10,9 @@
 - 规则所需属性**缺失（或值为 `null`）一律视为未命中**，继续判定下一条；
 - 同一用户在配置不变时判定结果**稳定**（哈希输入只有 `flag_key:user_id`）；
 - 每次创建 / 更新在**同一事务**中保存一份**不可变配置版本**，历史版本可查询、可指定用于判定；
+- 支持**按用户临时强制变体**（override）：未过期且变体仍存在于当前配置时短路规则与分桶，可设到期时间、可撤销；
 - 判定响应包含**命中规则、分桶值、最终变体的完整解释链**；
-- 每次判定落库为快照，可按 `request_id` 回查；支持 `request_id` **幂等重放**。
+- 每次判定落库为快照，可按 `request_id` 回查；支持 `request_id` **幂等重放**（override 事后变更 / 到期 / 删除也不影响首次结果）。
 
 ## 一条命令启动
 
@@ -63,6 +64,8 @@ curl -sS http://localhost:8000/api/v1/decisions/<request_id>
 | `GET` | `/api/v1/flags/{flag_key}/versions` | 列出全部配置版本（按版本号升序） |
 | `GET` | `/api/v1/flags/{flag_key}/versions/{version}` | 查看指定版本的完整配置 |
 | `POST` | `/api/v1/flags/{flag_key}/rollback` | 将指定历史版本复制为新当前版本（乐观版本检查，返回 `201`） |
+| `PUT` | `/api/v1/flags/{flag_key}/overrides/{user_id}` | 写入 / 替换某用户的临时强制变体（variant_key + reason + 可选 expires_at） |
+| `DELETE` | `/api/v1/flags/{flag_key}/overrides/{user_id}` | 撤销某用户的临时强制变体（幂等，返回 `204`） |
 | `POST` | `/api/v1/flags/{flag_key}/evaluate` | 判定（推荐，flag_key 在路径中，可指定 `config_version`） |
 | `POST` | `/api/v1/flags/{flag_key}/preview-impact` | 发布前候选配置影响预览（只读，不写版本 / 快照） |
 | `POST` | `/api/v1/evaluate` | 判定（flag_key 在请求体中） |
@@ -159,6 +162,84 @@ curl -sS -X POST http://localhost:8000/api/v1/flags/btn_color/rollback \
 - `target_version` 等于当前版本时也允许调用，效果是追加一份与当前内容相同的新版本快照；
 - 回滚产生的新版本与普通更新产生的版本没有区别，之后继续更新会在其版本号上顺序递增；回滚前的判定快照仍记录各自的 `config_version`，可用 `config_version` 继续钉住任意历史版本判定。
 
+### 按用户临时强制变体（override）
+
+需要为个别用户临时指定变体（客服补偿、内部白名单、故障止损）时，调用 `PUT /api/v1/flags/{flag_key}/overrides/{user_id}` 写入一条用户级 override；不再需要时用 `DELETE` 同一路径撤销。
+
+- 服务地址：`http://localhost:8000`（Docker Compose 一键启动后即为本机地址）。
+
+```bash
+# 为用户 user-1001 强制写入 on 变体，1 小时后自动到期（ISO 8601，必须是未来的 UTC 时间）
+curl -sS -X PUT http://localhost:8000/api/v1/flags/new_checkout/overrides/user-1001 \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "variant_key": "on",
+    "reason": "客服补偿：临时为该用户开启新版结账页",
+    "expires_at": "2026-09-18T12:00:00Z"
+  }'
+
+# 省略 expires_at 表示长期有效（DELETE 或再次 PUT 前一直生效）
+curl -sS -X PUT http://localhost:8000/api/v1/flags/new_checkout/overrides/user-1002 \
+  -H 'Content-Type: application/json' \
+  -d '{"variant_key": "on", "reason": "内部员工长期白名单"}'
+
+# 撤销（override 不存在也返回 204，DELETE 幂等）
+curl -sS -o /dev/null -w '%{http_code}\n' \
+  -X DELETE http://localhost:8000/api/v1/flags/new_checkout/overrides/user-1001
+```
+
+请求 / 响应字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `variant_key` | 必填，强制返回的变体；必须存在于开关**当前配置**，否则返回 `404` |
+| `reason` | 必填，非空的人工原因说明，会固化进判定快照的解释链 |
+| `expires_at` | 可选，到期时间（ISO 8601，建议带时区；无时区按 UTC 解释）。不是未来时间返回 `422`；省略表示长期有效 |
+
+PUT 为整体替换语义：重复写入同一 `{flag_key, user_id}` 会覆盖 `variant_key` / `reason` / `expires_at`，不新增记录。响应示例：
+
+```json
+{
+  "flag_key": "new_checkout",
+  "user_id": "user-1001",
+  "variant_key": "on",
+  "reason": "客服补偿：临时为该用户开启新版结账页",
+  "expires_at": "2026-09-18T12:00:00",
+  "created_at": "2026-09-18T03:07:59.886767",
+  "updated_at": "2026-09-18T03:07:59.886767"
+}
+```
+
+错误约定：开关不存在（PUT / DELETE）返回 `404`；开关存在但 `variant_key` 不在当前配置中（PUT）返回 `404`；`expires_at` 不是未来 UTC 时间（含无法解析的时间、`reason` / `variant_key` 为空）返回 `422`。
+
+判定时的生效规则：
+
+- **仅在未指定 `config_version` 时**参与判定；判定先读取该用户的 override，命中未过期且变体仍存在于当前配置的记录时直接返回该变体，**跳过规则判定与哈希分桶**，响应中 `decision_path="override"`、`matched_rule=null`、`bucket_value=null`；
+- 已**到期**、或强制变体已被配置更新**移除**的记录不生效，判定正常走规则与分桶（记录仍保留，变体重新加回当前配置后会再次生效；也可重新 PUT 或 DELETE 处理）；
+- 指定了 `config_version` 的钉版本判定**不读取** override，始终按该历史版本的规则与权重执行；
+- override 的变体、原因与路径会随判定一起固化为快照；之后即使 override 被修改、到期或删除，**同一 `request_id` 的重放仍返回首次结果**（与普通判定的幂等语义一致）。
+
+override 命中时的响应示例：
+
+```json
+{
+  "request_id": "7f7c0807-...",
+  "flag_key": "new_checkout",
+  "user_id": "user-1001",
+  "config_version": 1,
+  "matched_rule": null,
+  "bucket_value": null,
+  "variant_key": "on",
+  "decision_path": "override",
+  "explanation": [
+    {"step": "override_loaded",   "detail": {"variant_key": "on", "reason": "客服补偿：临时为该用户开启新版结账页", "expires_at": "2026-09-18T12:00:00"}},
+    {"step": "override_selected", "detail": {"variant_key": "on", "reason": "用户级临时强制变体命中，跳过规则判定与哈希分桶"}}
+  ]
+}
+```
+
+删除开关会一并删除其下全部 override，同名开关重建后旧记录不会复活。
+
 ### 规则操作符
 
 | operator | 语义 | values 用法 |
@@ -194,6 +275,7 @@ curl -sS -X POST http://localhost:8000/api/v1/flags/btn_color/rollback \
 
 - `decision_path = "rule"` 时 `matched_rule` 为命中规则、`bucket_value` 为 `null`；
 - `decision_path = "bucket"` 时 `matched_rule` 为 `null`，`bucket_value` 为 `0-99`；
+- `decision_path = "override"`（用户级临时强制变体命中）时 `matched_rule` 与 `bucket_value` 均为 `null`，解释链仅含 `override_loaded` / `override_selected`；
 - 配置更新会使 `config_version` 自增；**同一版本配置下，同一 `flag_key + user_id` 永远落入同一桶**。
 
 ### 幂等
@@ -320,10 +402,10 @@ bucket = int.from_bytes(sha256(f"{flag_key}:{user_id}")[:8], "big") % 100
 │   ├── engine.py      # 规则判定 + 稳定哈希分桶 + 解释链（纯函数，易测）
 │   ├── schemas.py     # Pydantic 请求/响应模型与配置校验
 │   ├── cursor.py      # 审计列表的不透明签名游标（边界 + 过滤绑定 + 高水位）
-│   ├── crud.py        # 配置、版本与快照持久化（含分页查询与索引补齐）
-│   ├── models.py      # SQLAlchemy ORM（flag_configs / flag_config_versions / decision_snapshots）
+│   ├── crud.py        # 配置、版本、快照与用户 override 持久化（含分页查询与老库列/索引补齐）
+│   ├── models.py      # SQLAlchemy ORM（flag_configs / flag_config_versions / decision_snapshots / user_overrides）
 │   └── database.py    # 引擎与会话
-├── tests/             # pytest：引擎单测 + API 集成测试（71 项）
+├── tests/             # pytest：引擎单测 + API 集成测试（98 项）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
@@ -339,6 +421,6 @@ python -m pytest -q
 ## 说明与边界
 
 - 服务定位为**本地 / 单机**使用：SQLite + 单实例，未做多副本一致性；
-- 判定快照只增不删（删除开关不影响历史快照回查）；配置版本随开关一并删除；
-- 快照保存判定时的 `config_version`；幂等重放重建 `matched_rule` 详情时优先取该版本的历史配置，版本记录缺失（如开关被删除重建）时回退到当前版本配置；
-- 本功能上线前已存在的开关，启动时会自动为当前版本补齐一条版本记录，此后每次更新正常追加。
+- 判定快照只增不删（删除开关不影响历史快照回查）；配置版本与用户 override 随开关一并删除；
+- 快照保存判定时的 `config_version` 与 `decision_path`；幂等重放重建 `matched_rule` 详情时优先取该版本的历史配置，版本记录缺失（如开关被删除重建）时回退到当前版本配置；
+- 本功能上线前已存在的开关，启动时会自动为当前版本补齐一条版本记录，此后每次更新正常追加；老库缺少的快照 `decision_path` 列也会在启动时幂等补齐（历史快照按是否命中过规则回退推断路径）。

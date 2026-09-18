@@ -113,11 +113,44 @@ def pick_variant_by_weight(variants: list[Variant], bucket: int) -> tuple[str, t
 @dataclass
 class Decision:
     variant_key: str
-    decision_path: str  # "rule" | "bucket"
+    decision_path: str  # "rule" | "bucket" | "override"
     bucket_value: int | None
     matched_rule: Rule | None
     matched_rule_index: int | None  # 排序后从 0 开始
     explanation: list[dict[str, Any]]
+
+
+def decide_override(variant_key: str, reason: str, expires_at: str | None) -> Decision:
+    """按用户 override 直接产出判定，跳过规则与分桶。
+
+    调用方负责保证记录未过期且变体仍存在于当前配置；原因与到期时间会被
+    固化进解释链，从而随判定快照一起持久化。
+    """
+    explanation = [
+        {
+            "step": "override_loaded",
+            "detail": {
+                "variant_key": variant_key,
+                "reason": reason,
+                "expires_at": expires_at,
+            },
+        },
+        {
+            "step": "override_selected",
+            "detail": {
+                "variant_key": variant_key,
+                "reason": "用户级临时强制变体命中，跳过规则判定与哈希分桶",
+            },
+        },
+    ]
+    return Decision(
+        variant_key=variant_key,
+        decision_path="override",
+        bucket_value=None,
+        matched_rule=None,
+        matched_rule_index=None,
+        explanation=explanation,
+    )
 
 
 def decide(
