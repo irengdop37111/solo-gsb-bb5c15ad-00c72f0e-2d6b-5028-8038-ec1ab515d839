@@ -1,5 +1,6 @@
 """请求 / 响应数据模型（Pydantic v2）。"""
 
+from datetime import datetime, timezone
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -102,6 +103,45 @@ class RollbackRequest(BaseModel):
     )
 
 
+class OverrideUpsertRequest(BaseModel):
+    """按用户写入 / 更新临时强制变体。
+
+    flag_key 与 user_id 取自路径；variant_key 必须是开关当前配置中存在的
+    变体（否则 404）；expires_at 可省略（表示不过期），提供时必须是
+    带时区、且严格晚于当前时刻的未来 UTC 时间（否则 422）。
+    """
+
+    variant_key: str = Field(min_length=1, max_length=128, description="强制返回的变体 key")
+    reason: str = Field(min_length=1, max_length=512, description="强制原因，随判定快照固化")
+    expires_at: datetime | None = Field(
+        default=None, description="可选过期时间（ISO 8601，须为未来的 UTC 时间）；省略表示不过期"
+    )
+
+    @field_validator("expires_at")
+    @classmethod
+    def _expires_must_be_future_utc(cls, v: datetime | None) -> datetime | None:
+        if v is None:
+            return None
+        if v.tzinfo is None or v.utcoffset() is None:
+            raise ValueError("expires_at 必须是带时区的 UTC 时间，例如 2026-09-20T08:00:00Z")
+        now = datetime.now(timezone.utc)
+        if v.astimezone(timezone.utc) <= now:
+            raise ValueError("expires_at 必须是晚于当前时刻的未来 UTC 时间")
+        return v.astimezone(timezone.utc)
+
+
+class OverrideResponse(BaseModel):
+    """一条按用户临时强制变体的当前状态。"""
+
+    flag_key: str
+    user_id: str
+    variant_key: str
+    reason: str
+    expires_at: datetime | None = Field(description="过期时间（UTC）；null 表示不过期")
+    created_at: datetime
+    updated_at: datetime
+
+
 class EvaluateRequest(BaseModel):
     flag_key: str | None = Field(default=None, max_length=128, description="路径式调用可省略")
     user_id: str = Field(min_length=1, max_length=128)
@@ -129,7 +169,7 @@ class EvaluateResponse(BaseModel):
     )
     bucket_value: int | None = Field(description="0-99 的稳定哈希分桶值；规则命中时为 null")
     variant_key: str
-    decision_path: Literal["rule", "bucket"]
+    decision_path: Literal["rule", "bucket", "override"]
     explanation: list[ExplanationStep]
 
 
@@ -142,6 +182,7 @@ class SnapshotResponse(BaseModel):
     bucket_value: int | None
     matched_rule_index: int | None
     variant_key: str
+    decision_path: Literal["rule", "bucket", "override"]
     explanation: list[ExplanationStep]
     decided_at: Any
 

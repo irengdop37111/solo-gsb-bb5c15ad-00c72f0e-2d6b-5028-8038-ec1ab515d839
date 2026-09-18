@@ -11,7 +11,6 @@ from app.database import Base
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
-
 class FlagConfig(Base):
     """功能开关配置。rules / variants 以 JSON 文本存储。"""
 
@@ -53,6 +52,33 @@ class FlagConfigVersion(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
+class FlagOverride(Base):
+    """按用户的临时强制变体（override）。
+
+    仅在判定未指定 ``config_version`` 时参与：未过期且 ``variant_key``
+    仍存在于当前配置的记录会跳过规则与分桶，直接返回指定变体
+    （``decision_path="override"``）。到期或变体已被移除的记录保留在库中
+    但不生效（变体再次加回配置时记录自动重新生效）。
+    """
+
+    __tablename__ = "flag_overrides"
+    __table_args__ = (
+        UniqueConstraint("flag_key", "user_id", name="uq_flag_override_flag_user"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    flag_key: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    user_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    variant_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    reason: Mapped[str] = mapped_column(String(512), nullable=False)
+    # null 表示不过期；否则存 naive UTC，判定时与当前 UTC 时间比较
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+
 class DecisionSnapshot(Base):
     """一次判定请求的完整快照，可按 request_id 回查。"""
 
@@ -82,5 +108,8 @@ class DecisionSnapshot(Base):
     bucket_value: Mapped[int | None] = mapped_column(Integer, nullable=True)
     matched_rule_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
     variant_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    # 判定路径：rule / bucket / override。老数据由 ensure_snapshot_decision_path
+    # 按 matched_rule_index 是否为空回填。
+    decision_path: Mapped[str | None] = mapped_column(String(16), nullable=True)
     explanation_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
     decided_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)

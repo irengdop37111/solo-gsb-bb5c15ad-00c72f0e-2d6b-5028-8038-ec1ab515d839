@@ -313,6 +313,7 @@ def test_items_follow_snapshot_response_shape(client):
         "bucket_value",
         "matched_rule_index",
         "variant_key",
+        "decision_path",
         "explanation",
         "decided_at",
     }
@@ -320,6 +321,8 @@ def test_items_follow_snapshot_response_shape(client):
     assert item["explanation"] == []
     assert item["bucket_value"] == 42
     assert item["config_version"] == 3
+    # 未命中规则的快照路径为 bucket（老快照无 decision_path 列时按规则下标推导）
+    assert item["decision_path"] == "bucket"
 
 
 def test_list_coexists_with_single_lookup(client):

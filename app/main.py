@@ -5,6 +5,8 @@
 - GET  /api/v1/flags              列出全部开关
 - GET  /api/v1/flags/{flag_key}   查看单个开关
 - DELETE /api/v1/flags/{flag_key} 删除开关（版本历史一并删除）
+- PUT    /api/v1/flags/{flag_key}/overrides/{user_id}  写入按用户临时强制变体
+- DELETE /api/v1/flags/{flag_key}/overrides/{user_id}  撤销按用户临时强制变体
 - GET  /api/v1/flags/{flag_key}/versions            列出版本历史
 - GET  /api/v1/flags/{flag_key}/versions/{version}  查看指定版本配置
 - POST /api/v1/flags/{flag_key}/rollback  回滚：将历史版本复制为新当前版本（乐观版本检查）
@@ -39,6 +41,8 @@ from app.schemas import (
     FlagResponse,
     FlagUpsertRequest,
     FlagVersionResponse,
+    OverrideResponse,
+    OverrideUpsertRequest,
     PreviewChange,
     PreviewImpactRequest,
     PreviewImpactResponse,
@@ -53,7 +57,8 @@ async def lifespan(app: FastAPI):
     db = next(get_db())
     try:
         crud.backfill_missing_versions(db)
-        # 老库 create_all 不会追加新索引，显式幂等补齐
+        # 老库 create_all 不会追加新列 / 新索引，显式幂等补齐
+        crud.ensure_snapshot_decision_path(db)
         crud.ensure_decision_audit_indexes(db)
     finally:
         db.close()
@@ -116,7 +121,9 @@ def _snapshot_to_response(snap, *, request_context: dict | None = None) -> dict:
         "matched_rule": None,
         "bucket_value": snap.bucket_value,
         "variant_key": snap.variant_key,
-        "decision_path": "rule" if snap.matched_rule_index is not None else "bucket",
+        # 新快照固化判定路径（含 override）；老数据无该列时按是否命中规则推导
+        "decision_path": snap.decision_path
+        or ("rule" if snap.matched_rule_index is not None else "bucket"),
         "explanation": json.loads(snap.explanation_json),
         # SnapshotResponse 扩展字段
         "request_context": context,
@@ -218,6 +225,48 @@ def delete_flag(flag_key: str, db: Session = Depends(get_db)) -> None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"开关 {flag_key!r} 不存在")
 
 
+@app.put(
+    "/api/v1/flags/{flag_key}/overrides/{user_id}",
+    response_model=OverrideResponse,
+)
+def put_override(
+    flag_key: str, user_id: str, req: OverrideUpsertRequest, db: Session = Depends(get_db)
+):
+    """写入（或覆盖）按用户的临时强制变体。
+
+    - 开关不存在返回 ``404``；variant_key 不在开关当前配置的变体中同样返回 ``404``；
+    - expires_at 缺省表示不过期；提供时必须是带时区的未来 UTC 时间，否则 ``422``
+      （由 Pydantic 校验）；
+    - 同一 flag_key + user_id 重复 PUT 为整体覆盖（variant_key / reason / expires_at）。
+    """
+    flag = crud.get_flag_or_none(db, flag_key)
+    if flag is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"开关 {flag_key!r} 不存在")
+    current_variant_keys = {v.key for v in crud.parse_variants(flag.variants_json)}
+    if req.variant_key not in current_variant_keys:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"开关 {flag_key!r} 的当前配置中不存在变体 {req.variant_key!r}",
+        )
+    ov = crud.upsert_override(db, flag_key, user_id, req)
+    return crud.override_to_response(ov)
+
+
+@app.delete(
+    "/api/v1/flags/{flag_key}/overrides/{user_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+def delete_override(flag_key: str, user_id: str, db: Session = Depends(get_db)) -> None:
+    """撤销按用户的临时强制变体。开关或 override 不存在均返回 ``404``。"""
+    if crud.get_flag_or_none(db, flag_key) is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"开关 {flag_key!r} 不存在")
+    if not crud.delete_override(db, flag_key, user_id):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"开关 {flag_key!r} 不存在用户 {user_id!r} 的临时强制变体",
+        )
+
+
 @app.get("/api/v1/flags/{flag_key}/versions", response_model=list[FlagVersionResponse])
 def list_flag_versions(flag_key: str, db: Session = Depends(get_db)):
     if crud.get_flag_or_none(db, flag_key) is None:
@@ -306,7 +355,19 @@ def _evaluate(req: EvaluateRequest, db: Session, flag_key: str) -> EvaluateRespo
 
     rules = crud.parse_rules(rules_json)
     variants = crud.parse_variants(variants_json)
-    decision = decide(flag.flag_key, req.user_id, req.context, variants, rules)
+
+    # 仅在未钉住历史版本时允许临时强制变体：未过期且变体仍存在于当前配置才生效；
+    # 到期或变体已移除的记录不参与，继续走规则与分桶。
+    decision = None
+    if req.config_version is None:
+        active_override = crud.get_active_override(
+            db, flag_key, req.user_id, {v.key for v in variants}
+        )
+        if active_override is not None:
+            decision = eng.override_decision(active_override)
+
+    if decision is None:
+        decision = decide(flag.flag_key, req.user_id, req.context, variants, rules)
 
     try:
         crud.save_snapshot(

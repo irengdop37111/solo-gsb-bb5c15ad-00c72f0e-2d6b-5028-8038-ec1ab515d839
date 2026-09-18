@@ -1,9 +1,12 @@
 """功能开关判定引擎。
 
 判定顺序：
-1. 按 priority 升序逐条评估规则，返回首个命中规则的 variant_key；
+1. 未指定 config_version 时，先查该 flag+user 是否存在“未过期且变体仍存在于
+   当前配置”的临时强制变体（override）：命中则跳过规则与分桶，直接返回该变体，
+   decision_path="override"。到期或变体已移除的记录不生效，继续正常判定。
+2. 按 priority 升序逐条评估规则，返回首个命中规则的 variant_key；
    规则所需属性缺失（或类型不兼容）一律视为“未命中”并继续下一条。
-2. 没有规则命中时，对 ``flag_key + ":" + user_id`` 做 SHA-256 稳定哈希，
+3. 没有规则命中时，对 ``flag_key + ":" + user_id`` 做 SHA-256 稳定哈希，
    映射到 0-99 的桶，再按变体权重顺序切桶选变体。
 
 同一用户在配置不变时结果稳定：哈希输入只含 flag_key 与 user_id。
@@ -31,6 +34,15 @@ class Variant:
     key: str
     weight: int
     description: str = ""
+
+
+@dataclass(frozen=True)
+class Override:
+    """按用户的临时强制变体（判定前由持久层读取）。"""
+
+    variant_key: str
+    reason: str
+    expires_at: Any = None  # naive UTC datetime 或 None（不过期）
 
 
 class RuleEvaluationError(ValueError):
@@ -113,11 +125,49 @@ def pick_variant_by_weight(variants: list[Variant], bucket: int) -> tuple[str, t
 @dataclass
 class Decision:
     variant_key: str
-    decision_path: str  # "rule" | "bucket"
+    decision_path: str  # "rule" | "bucket" | "override"
     bucket_value: int | None
     matched_rule: Rule | None
     matched_rule_index: int | None  # 排序后从 0 开始
     explanation: list[dict[str, Any]]
+
+
+def override_decision(ov: Override) -> Decision:
+    """临时强制变体命中：跳过规则与分桶，直接产出判定结果与解释链。
+
+    变体是否仍存在于当前配置、是否已过期由调用方在读取阶段判定，
+    进入本函数的 override 一定是“当前有效”的。
+    """
+    detail = {
+        "variant_key": ov.variant_key,
+        "reason": ov.reason,
+        "expires_at": ov.expires_at.isoformat() if ov.expires_at is not None else None,
+    }
+    explanation = [
+        {
+            "step": "override_loaded",
+            "detail": {
+                "variant_key": ov.variant_key,
+                "reason": ov.reason,
+                "expires_at": detail["expires_at"],
+            },
+        },
+        {
+            "step": "override_selected",
+            "detail": {
+                **detail,
+                "selection_reason": "命中按用户的临时强制变体，跳过规则判定与哈希分桶",
+            },
+        },
+    ]
+    return Decision(
+        variant_key=ov.variant_key,
+        decision_path="override",
+        bucket_value=None,
+        matched_rule=None,
+        matched_rule_index=None,
+        explanation=explanation,
+    )
 
 
 def decide(
